@@ -592,6 +592,7 @@ class IndexStore:
         languages: dict[str, int],
         git_head: str = "",
         folder_path: Optional[Path] = None,
+        file_hashes_override: Optional[dict] = None,
     ) -> Optional[CodeIndex]:
         """Incrementally update an existing index.
 
@@ -635,19 +636,24 @@ class IndexStore:
         for f in changed_files:
             old_files.add(f)
 
-        # Update file hashes (store mtime+size when folder_path is available)
-        file_hashes = dict(index.file_hashes)
-        for f in deleted_files:
-            file_hashes.pop(f, None)
-        for fp, content in raw_files.items():
-            if folder_path is not None:
-                abs_path = folder_path / fp
-                try:
-                    file_hashes[fp] = _make_file_meta(abs_path, content)
-                except OSError:
+        # Update file hashes
+        if file_hashes_override is not None:
+            # Caller supplies the complete post-update hashes (e.g. remote blob SHAs)
+            file_hashes = file_hashes_override
+        else:
+            # Compute from content, using mtime+size metadata when folder_path is available
+            file_hashes = dict(index.file_hashes)
+            for f in deleted_files:
+                file_hashes.pop(f, None)
+            for fp, content in raw_files.items():
+                if folder_path is not None:
+                    abs_path = folder_path / fp
+                    try:
+                        file_hashes[fp] = _make_file_meta(abs_path, content)
+                    except OSError:
+                        file_hashes[fp] = _file_hash(content)
+                else:
                     file_hashes[fp] = _file_hash(content)
-            else:
-                file_hashes[fp] = _file_hash(content)
 
         # Build updated index
         updated = CodeIndex(

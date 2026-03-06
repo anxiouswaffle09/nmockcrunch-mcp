@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +23,73 @@ from .tools.search_symbols import search_symbols
 from .tools.invalidate_cache import invalidate_cache
 from .tools.search_text import search_text
 from .tools.get_repo_outline import get_repo_outline
+
+
+_INDEX_TOOLS = {"index_folder", "index_repo", "invalidate_cache"}
+
+_log = logging.getLogger("jcodemunch")
+
+
+class AutoRefresher:
+    """Incrementally re-indexes watched paths before every read tool call."""
+
+    CONFIG_PATH = os.path.expanduser("~/.code-index/autorefresh.json")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_refresh: dict[str, float] = {}
+        self._paths: set[str] = set()
+        self._cooldown: float = 0.0
+        self._load_config()
+
+    def _load_config(self):
+        try:
+            with open(self.CONFIG_PATH) as f:
+                cfg = json.load(f)
+            self._cooldown = float(cfg.get("cooldown_secs", 0))
+            for p in cfg.get("paths", []):
+                self._paths.add(os.path.expanduser(str(p)))
+            _log.debug("autorefresh: watching %s", ", ".join(self._paths) or "(none)")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            _log.warning("autorefresh: config error: %s", e)
+
+    def register_path(self, path: str):
+        with self._lock:
+            self._paths.add(os.path.expanduser(path))
+            _log.debug("autorefresh: registered %s", path)
+
+    def maybe_refresh(self, storage_path: Optional[str]):
+        now = time.monotonic()
+        with self._lock:
+            paths = list(self._paths)
+        for path in paths:
+            with self._lock:
+                last = self._last_refresh.get(path, 0.0)
+                if now - last < self._cooldown:
+                    continue
+                self._last_refresh[path] = now
+            _log.debug("autorefresh: refreshing %s", path)
+            try:
+                result = index_folder(
+                    path=path,
+                    use_ai_summaries=False,
+                    storage_path=storage_path,
+                    incremental=True,
+                )
+                _log.debug(
+                    "autorefresh: %s — changed=%s new=%s deleted=%s",
+                    path,
+                    result.get("changed", 0),
+                    result.get("new", 0),
+                    result.get("deleted", 0),
+                )
+            except Exception as e:
+                _log.warning("autorefresh: error refreshing %s: %s", path, e)
+
+
+auto_refresher = AutoRefresher()
 
 
 # Create server
@@ -285,7 +354,11 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls."""
     storage_path = os.environ.get("CODE_INDEX_PATH")
-    
+
+    if name not in _INDEX_TOOLS:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, auto_refresher.maybe_refresh, storage_path)
+
     try:
         if name == "index_repo":
             result = await index_repo(
@@ -303,6 +376,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 follow_symlinks=arguments.get("follow_symlinks", False),
                 incremental=arguments.get("incremental", False),
             )
+            if result.get("success"):
+                auto_refresher.register_path(arguments["path"])
         elif name == "list_repos":
             result = list_repos(storage_path=storage_path)
         elif name == "get_file_tree":

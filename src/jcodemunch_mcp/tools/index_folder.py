@@ -1,6 +1,5 @@
 """Index local folder tool - walk, parse, summarize, save."""
 
-import hashlib
 import logging
 import os
 import sys
@@ -15,9 +14,6 @@ logger = logging.getLogger(__name__)
 from ..parser import parse_file, extract_refs, LANGUAGE_EXTENSIONS
 from ..security import (
     validate_path,
-    is_symlink_escape,
-    is_secret_file,
-    is_binary_file,
     should_exclude_file,
     DEFAULT_MAX_FILE_SIZE,
     get_max_index_files,
@@ -113,6 +109,17 @@ def discover_local_files(
         except Exception:
             pass
 
+    # Map should_exclude_file() reason strings to skip_counts keys
+    _REASON_TO_KEY: dict[str, str] = {
+        "symlink_escape": "symlink_escape",
+        "path_traversal": "path_traversal",
+        "outside_root": "path_traversal",
+        "secret_file": "secret",
+        "file_too_large": "too_large",
+        "unreadable": "unreadable",
+        "binary": "binary",
+    }
+
     for dirpath, dirnames, filenames in os.walk(str(root), followlinks=follow_symlinks):
         dir_path = Path(dirpath)
         try:
@@ -134,23 +141,13 @@ def discover_local_files(
         for filename in filenames:
             file_path = dir_path / filename
 
-            # Symlink protection
+            # Symlink: skip all symlinks when follow_symlinks is False
             if not follow_symlinks and file_path.is_symlink():
                 skip_counts["symlink"] += 1
                 logger.debug("SKIP symlink: %s", file_path)
                 continue
-            if file_path.is_symlink() and is_symlink_escape(root, file_path):
-                skip_counts["symlink_escape"] += 1
-                warnings.append(f"Skipped symlink escape: {file_path}")
-                continue
 
-            # Path traversal check
-            if not validate_path(root, file_path):
-                skip_counts["path_traversal"] += 1
-                warnings.append(f"Skipped path traversal: {file_path}")
-                continue
-
-            # Get relative path for pattern matching
+            # Get relative path for gitignore / skip-pattern matching
             try:
                 rel_path = file_path.relative_to(root).as_posix()
             except ValueError:
@@ -176,12 +173,6 @@ def discover_local_files(
                 logger.debug("SKIP extra_ignore: %s", rel_path)
                 continue
 
-            # Secret detection
-            if is_secret_file(rel_path):
-                skip_counts["secret"] += 1
-                warnings.append(f"Skipped secret file: {rel_path}")
-                continue
-
             # Extension filter
             ext = file_path.suffix
             if ext not in LANGUAGE_EXTENSIONS:
@@ -189,21 +180,17 @@ def discover_local_files(
                 logger.debug("SKIP wrong_extension: %s", rel_path)
                 continue
 
-            # Size limit
-            try:
-                if file_path.stat().st_size > max_size:
-                    skip_counts["too_large"] += 1
-                    logger.debug("SKIP too_large: %s", rel_path)
-                    continue
-            except OSError:
-                skip_counts["unreadable"] += 1
-                logger.debug("SKIP unreadable (stat failed): %s", rel_path)
-                continue
-
-            # Binary detection (content sniff for files with source extensions)
-            if is_binary_file(file_path):
-                skip_counts["binary"] += 1
-                warnings.append(f"Skipped binary file: {rel_path}")
+            # Security checks: path traversal, symlink escape, secret,
+            # file size, and binary detection — all via one call
+            reason = should_exclude_file(file_path, root, max_file_size=max_size)
+            if reason is not None:
+                key = _REASON_TO_KEY.get(reason, reason)
+                skip_counts[key] = skip_counts.get(key, 0) + 1
+                if reason in ("symlink_escape", "binary"):
+                    warnings.append(f"Skipped {reason.replace('_', ' ')}: {rel_path}")
+                elif reason == "secret_file":
+                    warnings.append(f"Skipped secret file: {rel_path}")
+                logger.debug("SKIP %s: %s", reason, rel_path)
                 continue
 
             logger.debug("ACCEPT: %s", rel_path)

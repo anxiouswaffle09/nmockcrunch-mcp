@@ -1,10 +1,8 @@
 """Index repository tool - fetch, parse, summarize, save."""
 
 import asyncio
-import hashlib
 import os
 from typing import Optional
-from types import SimpleNamespace
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -90,9 +88,9 @@ def discover_source_files(
     gitignore_content: Optional[str] = None,
     max_files: Optional[int] = None,
     max_size: int = 500 * 1024  # 500KB
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, dict[str, str]]:
     """Discover source files from tree entries.
-    
+
     Applies filtering pipeline:
     1. Type filter (blobs only)
     2. Extension filter (supported languages)
@@ -100,11 +98,15 @@ def discover_source_files(
     4. Size limit
     5. .gitignore matching
     6. File count limit
+
+    Returns:
+        Tuple of (file paths, truncated flag, blob_shas dict).
+        blob_shas maps path → git blob SHA for each accepted file.
     """
     import pathspec
 
     max_files = get_max_index_files(max_files)
-    
+
     # Parse gitignore if provided
     gitignore_spec = None
     if gitignore_content:
@@ -115,17 +117,18 @@ def discover_source_files(
             )
         except Exception:
             pass
-    
-    files = []
-    
+
+    files: list[str] = []
+    blob_shas: dict[str, str] = {}
+
     for entry in tree_entries:
         # Type filter - only blobs (files)
         if entry.get("type") != "blob":
             continue
-        
+
         path = entry.get("path", "")
         size = entry.get("size", 0)
-        
+
         # Extension filter
         _, ext = os.path.splitext(path)
         if ext not in LANGUAGE_EXTENSIONS:
@@ -142,24 +145,25 @@ def discover_source_files(
         # Binary extension check
         if is_binary_extension(path):
             continue
-        
+
         # Size limit
         if size > max_size:
             continue
-        
+
         # Gitignore matching
         if gitignore_spec and gitignore_spec.match_file(path):
             continue
-        
+
         files.append(path)
-    
+        blob_shas[path] = entry.get("sha", "")
+
     truncated = len(files) > max_files
 
     # File count limit with prioritization
     if truncated:
         # Prioritize: src/, lib/, pkg/, cmd/, internal/ first
         priority_dirs = ["src/", "lib/", "pkg/", "cmd/", "internal/"]
-        
+
         def priority_key(path):
             # Check if in priority dir
             for i, prefix in enumerate(priority_dirs):
@@ -167,11 +171,12 @@ def discover_source_files(
                     return (i, path.count("/"), path)
             # Not in priority dir - sort after
             return (len(priority_dirs), path.count("/"), path)
-        
+
         files.sort(key=priority_key)
         files = files[:max_files]
-    
-    return files, truncated
+        blob_shas = {p: blob_shas[p] for p in files}
+
+    return files, truncated, blob_shas
 
 
 async def fetch_file_content(
@@ -255,19 +260,17 @@ async def index_repo(
         # Fetch .gitignore
         gitignore_content = await fetch_gitignore(owner, repo, github_token)
         
-        # Discover source files
-        source_files, truncated = discover_source_files(
+        # Discover source files (also returns blob SHAs for change detection)
+        source_files, truncated, blob_shas = discover_source_files(
             tree_entries,
             gitignore_content,
             max_files=max_files,
         )
-        
+
         if not source_files:
             return {"success": False, "error": "No source files found"}
-        
-        # Fetch all file contents concurrently
-        semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
 
+        semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
         fetch_warnings: list[str] = []
 
         async def fetch_with_limit(path: str) -> tuple[str, Optional[str]]:
@@ -288,23 +291,27 @@ async def index_repo(
                 fetch_warnings.append(f"Failed to fetch {path} after 3 attempts")
                 return path, None
 
-        tasks = [fetch_with_limit(path) for path in source_files]
-        file_contents = await asyncio.gather(*tasks)
-
-        # Build current_files map from fetched content (None = failed, "" = empty file)
-        current_files: dict[str, str] = {}
-        for path, content in file_contents:
-            if content is not None:
-                current_files[path] = content
-        warnings.extend(fetch_warnings)
-
         store = IndexStore(base_path=storage_path)
 
-        # Incremental path
+        # Incremental path — detect changes via blob SHAs, download only what changed
         if incremental and store.load_index(owner, repo) is not None:
-            changed, new, deleted = store.detect_changes(owner, repo, current_files)
+            index = store.load_index(owner, repo)
+            stored_hashes: dict = index.file_hashes if index else {}
+            current_paths = set(source_files)
+            stored_paths = set(stored_hashes.keys())
 
-            if not changed and not new and not deleted:
+            # Compare blob SHAs: files not present in stored or with different SHA are changed.
+            # If stored hashes use the old content-SHA format (64-char), none will match the
+            # 40-char git blob SHAs — all files will be treated as changed, which triggers a
+            # full content download (correct fallback; subsequent runs use blob SHAs).
+            changed = [
+                p for p in current_paths & stored_paths
+                if blob_shas.get(p) != stored_hashes.get(p)
+            ]
+            new_files = list(current_paths - stored_paths)
+            deleted = list(stored_paths - current_paths)
+
+            if not changed and not new_files and not deleted:
                 return {
                     "success": True,
                     "message": "No changes detected",
@@ -312,13 +319,23 @@ async def index_repo(
                     "changed": 0, "new": 0, "deleted": 0,
                 }
 
-            files_to_parse = set(changed) | set(new)
+            # Only download content for files that actually changed or are new
+            files_to_download = set(changed) | set(new_files)
+            tasks = [fetch_with_limit(path) for path in files_to_download]
+            fetched = await asyncio.gather(*tasks)
+            warnings.extend(fetch_warnings)
+
+            current_files: dict[str, str] = {p: c for p, c in fetched if c is not None}
+
+            files_to_parse = set(changed) | set(new_files)
             new_symbols = []
             raw_files_subset: dict[str, str] = {}
 
             for path in files_to_parse:
-                content = current_files[path]
-                # Track file hashes for changed/new files even when symbol extraction yields none.
+                content = current_files.get(path)
+                if content is None:
+                    continue  # fetch failed
+                # Track file content for changed/new files even when symbol extraction yields none.
                 raw_files_subset[path] = content
                 _, ext = os.path.splitext(path)
                 language = LANGUAGE_EXTENSIONS.get(ext)
@@ -333,54 +350,43 @@ async def index_repo(
 
             new_symbols = summarize_symbols(new_symbols, use_ai=use_ai_summaries)
 
-            needs_full_backfill = store.load_refs(owner, repo) is None
+            # Update stored file_hashes with current blob SHAs (including unchanged files)
+            updated_hashes = dict(stored_hashes)
+            updated_hashes.update(blob_shas)
+            for p in deleted:
+                updated_hashes.pop(p, None)
+
             updated = store.incremental_save(
                 owner=owner, name=repo,
-                changed_files=changed, new_files=new, deleted_files=deleted,
+                changed_files=changed, new_files=new_files, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
                 languages={},
+                file_hashes_override=updated_hashes,
             )
 
-            if needs_full_backfill:
-                # No refs.json existed — backfill refs for all current files
-                all_sym_dicts = updated.symbols if updated else []
-                all_refs = []
-                for path, content in current_files.items():
-                    _, ext = os.path.splitext(path)
-                    language = LANGUAGE_EXTENSIONS.get(ext)
-                    if not language:
-                        continue
-                    try:
-                        proxies = [
-                            SimpleNamespace(line=s["line"], end_line=s["end_line"],
-                                            id=s["id"], file=s["file"])
-                            for s in all_sym_dicts if s.get("file") == path
-                        ]
-                        all_refs.extend(extract_refs(content, path, language, proxies))
-                    except Exception:
-                        pass
-                store.save_refs(owner, repo, all_refs)
-            else:
-                incremental_refs = []
-                for path in files_to_parse:
-                    content = current_files[path]
-                    _, ext = os.path.splitext(path)
-                    language = LANGUAGE_EXTENSIONS.get(ext)
-                    if not language:
-                        continue
-                    try:
-                        file_symbols = [s for s in new_symbols if s.file == path]
-                        incremental_refs.extend(extract_refs(content, path, language, file_symbols))
-                    except Exception:
-                        warnings.append(f"Failed to extract refs for {path}")
-                removed = set(changed) | set(deleted)
-                store.merge_refs(owner, repo, incremental_refs, removed)
+            # Compute refs for downloaded files and merge (handles missing refs.json too)
+            incremental_refs = []
+            for path in files_to_parse:
+                content = current_files.get(path)
+                if content is None:
+                    continue  # fetch failed
+                _, ext = os.path.splitext(path)
+                language = LANGUAGE_EXTENSIONS.get(ext)
+                if not language:
+                    continue
+                try:
+                    file_symbols = [s for s in new_symbols if s.file == path]
+                    incremental_refs.extend(extract_refs(content, path, language, file_symbols))
+                except Exception:
+                    warnings.append(f"Failed to extract refs for {path}")
+            removed = set(changed) | set(deleted)
+            store.merge_refs(owner, repo, incremental_refs, removed)
 
             result = {
                 "success": True,
                 "repo": f"{owner}/{repo}",
                 "incremental": True,
-                "changed": len(changed), "new": len(new), "deleted": len(deleted),
+                "changed": len(changed), "new": len(new_files), "deleted": len(deleted),
                 "symbol_count": len(updated.symbols) if updated else 0,
                 "indexed_at": updated.indexed_at if updated else "",
                 "ref_count": len(store.load_refs(owner, repo) or []),
@@ -389,7 +395,12 @@ async def index_repo(
                 result["warnings"] = warnings
             return result
 
-        # Full index path
+        # Full index path — fetch all source files
+        tasks = [fetch_with_limit(path) for path in source_files]
+        fetched = await asyncio.gather(*tasks)
+        warnings.extend(fetch_warnings)
+        current_files: dict[str, str] = {p: c for p, c in fetched if c is not None}
+
         all_symbols = []
         languages = {}
         raw_files = {}
@@ -418,13 +429,9 @@ async def index_repo(
         # Generate summaries
         all_symbols = summarize_symbols(all_symbols, use_ai=use_ai_summaries)
 
-        # Save index
-        # Track hashes for all discovered source files so incremental change detection
-        # does not repeatedly report no-symbol files as "new".
-        file_hashes = {
-            fp: hashlib.sha256(content.encode("utf-8")).hexdigest()
-            for fp, content in current_files.items()
-        }
+        # Save index — store git blob SHAs for efficient future incremental detection.
+        # Only store for files whose content was successfully fetched (missing = try again next time).
+        file_hashes = {path: blob_shas[path] for path in current_files if path in blob_shas}
         store.save_index(
             owner=owner,
             name=repo,

@@ -287,8 +287,8 @@ def should_exclude_file(
     except OSError:
         return "unreadable"
 
-    # Binary detection (extension first, then content)
-    if check_binary and is_binary_extension(rel_path):
-        return "binary_extension"
+    # Binary detection: extension check first (fast), then content sniff (slower)
+    if check_binary and is_binary_file(file_path):
+        return "binary"
 
     return None

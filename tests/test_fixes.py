@@ -848,3 +848,137 @@ class TestMakeFileMeta:
         assert "size" in meta
         assert meta["sha256"] == _file_hash("hello")
         assert meta["size"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Remaining fixes (Issues 17 & 27)
+# ---------------------------------------------------------------------------
+
+class TestDiscoverSourceFilesBlobShas:
+    """Issue 17: discover_source_files returns blob SHAs from tree entries."""
+
+    def test_blob_sha_in_return(self):
+        from jcodemunch_mcp.tools.index_repo import discover_source_files
+
+        tree = [
+            {"type": "blob", "path": "main.py", "size": 100, "sha": "abc123"},
+            {"type": "blob", "path": "README.md", "size": 50, "sha": "def456"},  # wrong ext
+            {"type": "tree", "path": "src", "size": 0, "sha": "777"},
+        ]
+        files, truncated, blob_shas = discover_source_files(tree)
+        assert "main.py" in files
+        assert "main.py" in blob_shas
+        assert blob_shas["main.py"] == "abc123"
+        # README.md filtered out by extension
+        assert "README.md" not in files
+        assert "README.md" not in blob_shas
+
+    def test_truncation_prunes_blob_shas(self):
+        """When file limit truncates the list, blob_shas is pruned to match."""
+        from jcodemunch_mcp.tools.index_repo import discover_source_files
+
+        # Generate 5 py files, limit to 3
+        tree = [
+            {"type": "blob", "path": f"f{i}.py", "size": 10, "sha": f"sha{i}"}
+            for i in range(5)
+        ]
+        files, truncated, blob_shas = discover_source_files(tree, max_files=3)
+        assert truncated
+        assert len(files) == 3
+        assert set(blob_shas.keys()) == set(files), "blob_shas must match truncated file list"
+
+
+class TestIncrementalBlobShaDetection:
+    """Issue 17: incremental_save accepts file_hashes_override (blob SHAs)."""
+
+    def _make_index(self, store, owner, name, hashes):
+        """Helper: create a minimal stored index with given file_hashes."""
+        idx = CodeIndex(
+            repo=f"{owner}/{name}", owner=owner, name=name,
+            indexed_at="2025-01-01T00:00:00",
+            source_files=list(hashes.keys()),
+            languages={}, symbols=[],
+            file_hashes=hashes,
+        )
+        index_path = store._index_path(owner, name)
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(index_path, "w") as f:
+            json.dump(store._index_to_dict(idx), f)
+        _invalidate_index_cache(index_path)
+        return idx
+
+    def test_file_hashes_override_used(self, tmp_path):
+        """When file_hashes_override is passed, incremental_save stores those hashes."""
+        store = IndexStore(base_path=str(tmp_path))
+        self._make_index(store, "o", "r", {"a.py": "old_sha"})
+
+        blob_overrides = {"a.py": "new_blob_sha", "b.py": "b_blob_sha"}
+        store.incremental_save(
+            owner="o", name="r",
+            changed_files=["a.py"], new_files=["b.py"], deleted_files=[],
+            new_symbols=[], raw_files={"a.py": "x", "b.py": "y"},
+            languages={},
+            file_hashes_override=blob_overrides,
+        )
+        updated = store.load_index("o", "r")
+        assert updated.file_hashes["a.py"] == "new_blob_sha"
+        assert updated.file_hashes["b.py"] == "b_blob_sha"
+
+    def test_without_override_uses_content_hash(self, tmp_path):
+        """Without override, incremental_save computes content SHA-256 as before."""
+        store = IndexStore(base_path=str(tmp_path))
+        self._make_index(store, "o", "r", {"a.py": "old"})
+
+        store.incremental_save(
+            owner="o", name="r",
+            changed_files=["a.py"], new_files=[], deleted_files=[],
+            new_symbols=[], raw_files={"a.py": "new content"},
+            languages={},
+        )
+        updated = store.load_index("o", "r")
+        # Should be content SHA-256, not the old value
+        assert updated.file_hashes["a.py"] == _file_hash("new content")
+
+
+class TestShouldExcludeFileUnified:
+    """Issue 27: discover_local_files uses should_exclude_file for security checks."""
+
+    def test_no_direct_is_binary_file_import(self):
+        """is_binary_file, is_symlink_escape, is_secret_file no longer imported directly."""
+        import inspect
+        from jcodemunch_mcp.tools import index_folder as _mod
+        src = inspect.getsource(_mod)
+        assert "is_binary_file" not in src
+        assert "is_symlink_escape" not in src
+        assert "is_secret_file" not in src
+
+    def test_should_exclude_file_called(self):
+        """should_exclude_file is used in discover_local_files source."""
+        import inspect
+        from jcodemunch_mcp.tools.index_folder import discover_local_files
+        src = inspect.getsource(discover_local_files)
+        assert "should_exclude_file" in src
+
+    def test_binary_file_excluded(self, tmp_path):
+        """A file with null bytes (binary content) is excluded from discovery."""
+        from jcodemunch_mcp.tools.index_folder import discover_local_files
+
+        py_file = tmp_path / "binary.py"
+        py_file.write_bytes(b"def foo():\n    pass\x00\x00\x00")  # null bytes = binary
+        files, warnings, skip_counts = discover_local_files(tmp_path)
+        assert py_file not in files
+        assert skip_counts["binary"] >= 1
+
+    def test_secret_file_excluded(self, tmp_path):
+        """A file matching a secret pattern (with source extension) is excluded."""
+        from jcodemunch_mcp.tools.index_folder import discover_local_files
+
+        # Use a .py extension so it passes the extension filter, but a name matching
+        # the "*secret*" pattern in SECRET_PATTERNS so should_exclude_file catches it.
+        secret = tmp_path / "my_secrets.py"
+        secret.write_text("API_KEY = 'abc123'")
+        (tmp_path / "main.py").write_text("def f(): pass")
+        files, warnings, skip_counts = discover_local_files(tmp_path)
+        assert secret not in files
+        assert skip_counts["secret"] >= 1
+        assert any("secret file" in w.lower() for w in warnings)

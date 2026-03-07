@@ -475,7 +475,7 @@ async def index_repo(
         # Save index — store git blob SHAs for efficient future incremental detection.
         # Only store for files whose content was successfully fetched (missing = try again next time).
         file_hashes = {path: blob_shas[path] for path in current_files if path in blob_shas}
-        store.save_index(
+        saved_index = store.save_index(
             owner=owner,
             name=repo,
             source_files=sorted(current_files),
@@ -501,7 +501,7 @@ async def index_repo(
         result = {
             "success": True,
             "repo": f"{owner}/{repo}",
-            "indexed_at": store.load_index(owner, repo).indexed_at,
+            "indexed_at": saved_index.indexed_at,
             "file_count": len(parsed_files),
             "symbol_count": len(all_symbols),
             "ref_count": len(all_refs),

@@ -444,7 +444,7 @@ def test_get_ref_count_reads_stored_field(tmp_path):
 def test_get_ref_count_fallback_for_old_format(tmp_path):
     """Falls back to len(refs) when ref_count field is absent (old format)."""
     store = IndexStore(base_path=str(tmp_path))
-    refs_path = tmp_path / "owner-repo-refs.json"
+    refs_path = store._refs_path("owner", "repo")
     refs_path.write_text(
         json.dumps({"repo": "owner/repo", "refs": [{}, {}, {}]}),
         encoding="utf-8",

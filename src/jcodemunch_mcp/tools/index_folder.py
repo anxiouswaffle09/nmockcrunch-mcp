@@ -371,11 +371,17 @@ def index_folder(
             from ..storage.index_store import _get_git_head
             git_head = _get_git_head(folder_path) or ""
 
+            # Check before incremental_save — safe either way since incremental_save
+            # never reads or writes the refs file. The check must happen before we
+            # save so we know whether to run a full backfill or a partial merge.
             needs_full_backfill = store.load_refs(owner, repo_name) is None
             updated = store.incremental_save(
                 owner=owner, name=repo_name,
                 changed_files=changed, new_files=new, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
+                # languages={} is intentional — incremental_save recomputes language
+                # counts from the merged symbol list via _languages_from_symbols.
+                # This parameter is a legacy fallback only used when symbols are absent.
                 languages={}, git_head=git_head,
                 folder_path=folder_path,
             )
@@ -383,6 +389,10 @@ def index_folder(
             if needs_full_backfill:
                 # refs.json missing — backfill refs for ALL current files.
                 # Reuse already-read content; read remaining files from disk on demand.
+                #
+                # updated.symbols is list[dict] (serialised from disk by incremental_save),
+                # not list[Symbol]. We use SimpleNamespace proxies below so extract_refs
+                # gets the same duck-typed interface it expects from Symbol objects.
                 all_sym_dicts = updated.symbols if updated else []
                 all_refs: list[dict] = []
                 for file_path in source_files:
@@ -403,6 +413,9 @@ def index_folder(
                         except Exception:
                             continue
                     try:
+                        # The four dict keys (line/end_line/id/file) are always written
+                        # by _symbol_to_dict — no KeyError risk. The try/except here
+                        # guards extract_refs (tree-sitter parse on arbitrary content).
                         proxies = [
                             SimpleNamespace(line=s["line"], end_line=s["end_line"],
                                             id=s["id"], file=s["file"])
@@ -413,7 +426,12 @@ def index_folder(
                         pass
                 store.save_refs(owner, repo_name, all_refs)
             else:
-                # Update cross-references for changed/new files only
+                # Update cross-references for changed/new files only.
+                # new_symbols is list[Symbol] (freshly parsed this run), unlike
+                # all_sym_dicts above which is list[dict] loaded from disk. The two
+                # paths use different types because they have different sources: the
+                # backfill needs ALL symbols (including untouched files) which only
+                # exist as serialised dicts; this path only needs this run's symbols.
                 incremental_refs: list[dict] = []
                 for rel_path in files_to_parse:
                     content = parsed_content.get(rel_path)
@@ -431,6 +449,10 @@ def index_folder(
                 removed = set(changed) | set(deleted)
                 store.merge_refs(owner, repo_name, incremental_refs, removed)
 
+            # Incremental result deliberately omits file_count, languages, and files
+            # (the 20-file sample) that the full-index result includes. Those require
+            # loading the entire index or re-scanning all files — too expensive for a
+            # diff-only run. Callers that need them should trigger a full index.
             result = {
                 "success": True,
                 "repo": f"{owner}/{repo_name}",

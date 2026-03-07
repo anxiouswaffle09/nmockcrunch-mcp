@@ -375,10 +375,15 @@ async def index_repo(
                 owner=owner, name=repo,
                 changed_files=actual_changed, new_files=actual_new, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
+                # languages={} is intentional — incremental_save recomputes language
+                # counts from the merged symbol list via _languages_from_symbols.
+                # This parameter is a legacy fallback only used when symbols are absent.
                 languages={},
                 file_hashes_override=updated_hashes,
             )
 
+            # Checked after incremental_save — safe because incremental_save never
+            # reads or writes the refs file, so the result is the same either side.
             needs_full_backfill = store.load_refs(owner, repo) is None
             if needs_full_backfill:
                 # refs.json missing — rebuild refs for ALL current source files.
@@ -391,6 +396,10 @@ async def index_repo(
                 warnings.extend(fetch_warnings[prev_warn_count:])
                 backfill_content = dict(current_files)
                 backfill_content.update({p: c for p, c in extra_fetched if c is not None})
+                # updated.symbols is list[dict] (serialised from disk by incremental_save),
+                # not list[Symbol]. SimpleNamespace proxies below give extract_refs the
+                # duck-typed interface it expects. The four keys are always written by
+                # _symbol_to_dict so KeyError can't occur; the try/except guards extract_refs.
                 all_sym_dicts = updated.symbols if updated else []
                 all_refs = []
                 for path, content in backfill_content.items():

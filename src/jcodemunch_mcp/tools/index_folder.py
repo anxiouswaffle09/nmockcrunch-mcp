@@ -299,26 +299,7 @@ def index_folder(
         owner = "local"
         store = IndexStore(base_path=storage_path)
 
-        # Read all files to build current_files map
-        current_files: dict[str, str] = {}
-        for file_path in source_files:
-            if not validate_path(folder_path, file_path):
-                continue
-            try:
-                content = file_path.read_text(encoding="utf-8", errors="replace")
-            except Exception as e:
-                warnings.append(f"Failed to read {file_path}: {e}")
-                continue
-            try:
-                rel_path = file_path.relative_to(folder_path).as_posix()
-            except ValueError:
-                continue
-            ext = file_path.suffix
-            if ext not in LANGUAGE_EXTENSIONS:
-                continue
-            current_files[rel_path] = content
-
-        # Incremental path: detect changes and only re-parse affected files
+        # Incremental path: detect changes, then read only what changed
         if incremental and store.load_index(owner, repo_name) is not None:
             changed, new, deleted = store.detect_changes_fast(
                 owner, repo_name, folder_path, source_files, source_path=folder_path
@@ -333,17 +314,36 @@ def index_folder(
                     "changed": 0, "new": 0, "deleted": 0,
                 }
 
-            # Parse only changed + new files
+            # Read ONLY changed + new files
             files_to_parse = set(changed) | set(new)
+            parsed_content: dict[str, str] = {}
+            for file_path in source_files:
+                if not validate_path(folder_path, file_path):
+                    continue
+                try:
+                    rel_path = file_path.relative_to(folder_path).as_posix()
+                except ValueError:
+                    continue
+                if rel_path not in files_to_parse:
+                    continue
+                try:
+                    content = file_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    warnings.append(f"Failed to read {file_path}: {e}")
+                    continue
+                ext = file_path.suffix
+                if ext not in LANGUAGE_EXTENSIONS:
+                    continue
+                parsed_content[rel_path] = content
+
             new_symbols = []
             raw_files_subset: dict[str, str] = {}
 
             incremental_no_symbols: list[str] = []
             for rel_path in files_to_parse:
-                content = current_files.get(rel_path)
+                content = parsed_content.get(rel_path)
                 if content is None:
                     continue  # file disappeared between discover and read
-                # Track file hashes for changed/new files even when symbol extraction yields none.
                 raw_files_subset[rel_path] = content
                 ext = os.path.splitext(rel_path)[1]
                 language = LANGUAGE_EXTENSIONS.get(ext)
@@ -381,14 +381,27 @@ def index_folder(
             )
 
             if needs_full_backfill:
-                # No refs.json existed — backfill refs for all current files
+                # refs.json missing — backfill refs for ALL current files.
+                # Reuse already-read content; read remaining files from disk on demand.
                 all_sym_dicts = updated.symbols if updated else []
                 all_refs: list[dict] = []
-                for rel_path, content in current_files.items():
+                for file_path in source_files:
+                    if not validate_path(folder_path, file_path):
+                        continue
+                    try:
+                        rel_path = file_path.relative_to(folder_path).as_posix()
+                    except ValueError:
+                        continue
                     ext = os.path.splitext(rel_path)[1]
                     language = LANGUAGE_EXTENSIONS.get(ext)
                     if not language:
                         continue
+                    content = parsed_content.get(rel_path)
+                    if content is None:
+                        try:
+                            content = file_path.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            continue
                     try:
                         proxies = [
                             SimpleNamespace(line=s["line"], end_line=s["end_line"],
@@ -403,7 +416,7 @@ def index_folder(
                 # Update cross-references for changed/new files only
                 incremental_refs: list[dict] = []
                 for rel_path in files_to_parse:
-                    content = current_files.get(rel_path)
+                    content = parsed_content.get(rel_path)
                     if content is None:
                         continue
                     ext = os.path.splitext(rel_path)[1]
@@ -436,6 +449,24 @@ def index_folder(
             return result
 
         # Full index path
+        current_files: dict[str, str] = {}
+        for file_path in source_files:
+            if not validate_path(folder_path, file_path):
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                warnings.append(f"Failed to read {file_path}: {e}")
+                continue
+            try:
+                rel_path = file_path.relative_to(folder_path).as_posix()
+            except ValueError:
+                continue
+            ext = file_path.suffix
+            if ext not in LANGUAGE_EXTENSIONS:
+                continue
+            current_files[rel_path] = content
+
         all_symbols = []
         languages = {}
         raw_files = {}

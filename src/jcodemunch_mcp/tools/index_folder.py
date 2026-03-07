@@ -371,13 +371,20 @@ def index_folder(
             from ..storage.index_store import _get_git_head
             git_head = _get_git_head(folder_path) or ""
 
+            # Only pass files we successfully read to incremental_save.
+            # Files that failed to read are excluded so their existing symbols
+            # are not stripped from the index — same pattern as index_repo.py.
+            successfully_read = set(parsed_content.keys())
+            actual_changed = [f for f in changed if f in successfully_read]
+            actual_new = [f for f in new if f in successfully_read]
+
             # Check before incremental_save — safe either way since incremental_save
             # never reads or writes the refs file. The check must happen before we
             # save so we know whether to run a full backfill or a partial merge.
             needs_full_backfill = store.load_refs(owner, repo_name) is None
             updated = store.incremental_save(
                 owner=owner, name=repo_name,
-                changed_files=changed, new_files=new, deleted_files=deleted,
+                changed_files=actual_changed, new_files=actual_new, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
                 # languages={} is intentional — incremental_save recomputes language
                 # counts from the merged symbol list via _languages_from_symbols.
@@ -458,7 +465,7 @@ def index_folder(
                 "repo": f"{owner}/{repo_name}",
                 "folder_path": str(folder_path),
                 "incremental": True,
-                "changed": len(changed), "new": len(new), "deleted": len(deleted),
+                "changed": len(actual_changed), "new": len(actual_new), "deleted": len(deleted),
                 "symbol_count": len(updated.symbols) if updated else 0,
                 "indexed_at": updated.indexed_at if updated else "",
                 "ref_count": store.get_ref_count(owner, repo_name),

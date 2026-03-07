@@ -226,6 +226,66 @@ class TestIncrementalIndexFolder:
         assert inc3["new"] == 0
         assert inc3["deleted"] == 0
 
+    def test_incremental_preserves_symbols_when_read_text_fails(self, tmp_path):
+        """If read_text fails during the parse loop, existing symbols must not be stripped.
+
+        Simulates a file that passes binary-check (discovery) but fails the full
+        content read in the incremental parse loop (e.g. network FS dropping mid-read).
+        The binary check uses open()+read(8192), while the parse loop uses read_text(),
+        so patching Path.read_text isolates exactly the D1 failure mode.
+        """
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        store_path = tmp_path / "store"
+
+        _write_py(src, "a.py", "def foo():\n    pass\n\ndef bar():\n    pass\n")
+        _write_py(src, "b.py", "def baz():\n    pass\n")
+
+        # Full index — a.py contributes foo and bar
+        result = index_folder(str(src), use_ai_summaries=False, storage_path=str(store_path))
+        assert result["success"] is True
+
+        # Write new content so detect_changes_fast marks a.py as changed
+        _write_py(src, "a.py", "def foo():\n    return 1\n\ndef bar():\n    pass\n")
+
+        # Patch Path.read_text so it raises for a.py during the parse loop only.
+        # detect_changes_fast Phase 2 also calls read_text for SHA verification —
+        # that first call must succeed so a.py lands in `changed`, not `deleted`.
+        # The second call is from the incremental parse loop: that one we fail.
+        original_read_text = Path.read_text
+        read_call_count: dict[str, int] = {}
+
+        def failing_read_text(self, *args, **kwargs):
+            if self.name == "a.py":
+                n = read_call_count.get("a.py", 0) + 1
+                read_call_count["a.py"] = n
+                if n > 1:  # second call = parse loop; raise to simulate failure
+                    raise PermissionError("Simulated read failure for a.py")
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", failing_read_text):
+            result2 = index_folder(
+                str(src), use_ai_summaries=False, storage_path=str(store_path), incremental=True
+            )
+
+        assert result2["success"] is True
+        assert result2["incremental"] is True
+        # Read failed so a.py was excluded from actual_changed
+        assert result2["changed"] == 0
+        # A warning must be emitted for the read failure
+        assert "warnings" in result2
+
+        # a.py's original symbols (foo, bar) must still be in the index
+        store = IndexStore(base_path=str(store_path))
+        index = store.load_index("local", src.name)
+        assert index is not None
+        sym_names = {s["name"] for s in index.symbols}
+        assert "foo" in sym_names, "foo was stripped despite read failure"
+        assert "bar" in sym_names, "bar was stripped despite read failure"
+        assert "baz" in sym_names
+
     def test_incremental_rebuilds_refs_when_refs_json_missing(self, tmp_path):
         """If refs.json is deleted, the next incremental run backfills it from all current files."""
         src = tmp_path / "src"

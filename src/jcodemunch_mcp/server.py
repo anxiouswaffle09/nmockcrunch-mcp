@@ -104,18 +104,18 @@ class AutoRefresher:
         except OSError:
             pass
 
-    def register_path(self, path: str):
+    def register_path(self, path: str) -> bool:
         resolved = os.path.realpath(os.path.expanduser(str(path)))
         with self._lock:
             if resolved in self._paths:
-                return
+                return True
             if len(self._paths) >= MAX_WATCHED_PATHS:
                 _log.warning(
                     "autorefresh: watchlist full (%d paths). "
                     "Add path to autorefresh.json manually to persist it.",
                     MAX_WATCHED_PATHS,
                 )
-                return
+                return False
             self._paths.add(resolved)
 
         # Persist to config atomically
@@ -131,6 +131,43 @@ class AutoRefresher:
         tmp.write_text(json.dumps(existing, indent=2))
         tmp.replace(cfg_path)
         _log.debug("autorefresh: registered and persisted %s", resolved)
+        return True
+
+    def remove_path(self, path: str) -> bool:
+        """Remove path from watchlist and persist. Returns True if path was present."""
+        resolved = os.path.realpath(os.path.expanduser(str(path)))
+        with self._lock:
+            if resolved not in self._paths:
+                return False
+            self._paths.discard(resolved)
+        cfg_path = Path(self.CONFIG_PATH)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg_path.with_suffix(".json.tmp")
+        try:
+            existing = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        except Exception:
+            existing = {}
+        paths_set = set(existing.get("paths", [])) - {resolved}
+        existing["paths"] = sorted(paths_set)
+        tmp.write_text(json.dumps(existing, indent=2))
+        tmp.replace(cfg_path)
+        _log.debug("autorefresh: removed and persisted %s", resolved)
+        return True
+
+    def get_watched_paths(self) -> list[str]:
+        """Return a sorted snapshot of currently watched paths."""
+        self._maybe_reload_config()
+        with self._lock:
+            return sorted(self._paths)
+
+    def is_path_watched(self, path: str) -> bool:
+        """Check if path falls within a watched directory. Empty watchlist = allow all."""
+        self._maybe_reload_config()
+        resolved = os.path.realpath(os.path.expanduser(str(path)))
+        with self._lock:
+            if not self._paths:
+                return True
+            return any(resolved == p or resolved.startswith(p + os.sep) for p in self._paths)
 
     def maybe_refresh(self, storage_path: Optional[str]):
         self._maybe_reload_config()
@@ -528,6 +565,42 @@ async def list_tools() -> list[Tool]:
                 "required": ["repo", "field_name"]
             }
         ),
+        Tool(
+            name="add_to_watchlist",
+            description="IMPORTANT: Only call this when the user explicitly asks to add a path to the watchlist. Do not call autonomously — it modifies security policy. Adds a local directory to the jcodemunch path watchlist; once added, query tools are allowed when the server runs from that directory and it is auto-refreshed before every query.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the project directory (supports ~)"
+                    }
+                },
+                "required": ["path"]
+            }
+        ),
+        Tool(
+            name="remove_from_watchlist",
+            description="IMPORTANT: Only call this when the user explicitly asks to remove a path from the watchlist. Do not call autonomously. Removes a local directory from the jcodemunch path watchlist; after removal, query tools will be blocked when running from that directory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to remove (must match the resolved path as it was added)"
+                    }
+                },
+                "required": ["path"]
+            }
+        ),
+        Tool(
+            name="list_watched_paths",
+            description="List all directories currently in the jcodemunch path watchlist.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
     ]
 
 
@@ -537,6 +610,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     storage_path = os.environ.get("CODE_INDEX_PATH")
 
     if name in _REFRESH_TOOLS:
+        if not auto_refresher.is_path_watched(os.getcwd()):
+            cwd = os.getcwd()
+            return [TextContent(type="text", text=json.dumps({
+                "error": "PATH_GUARD_BLOCKED",
+                "message": (
+                    f"jcodemunch tools are blocked: current directory ({cwd!r}) is not in "
+                    "the watchlist. Use Read/Grep/Glob for file exploration instead, or add "
+                    "this project with add_to_watchlist."
+                ),
+            }, indent=2))]
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, auto_refresher.maybe_refresh, storage_path)
 
@@ -549,16 +632,41 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 incremental=arguments.get("incremental", False),
             )
         elif name == "index_folder":
-            result = index_folder(
-                path=arguments["path"],
-                use_ai_summaries=arguments.get("use_ai_summaries", True),
-                storage_path=storage_path,
-                extra_ignore_patterns=arguments.get("extra_ignore_patterns"),
-                follow_symlinks=arguments.get("follow_symlinks", False),
-                incremental=arguments.get("incremental", False),
-            )
-            if result.get("success"):
-                auto_refresher.register_path(arguments["path"])
+            folder_path = arguments["path"]
+            if not auto_refresher.is_path_watched(folder_path):
+                resolved = os.path.realpath(os.path.expanduser(str(folder_path)))
+                result = {
+                    "error": "PATH_GUARD_BLOCKED",
+                    "message": (
+                        f"index_folder blocked: {resolved!r} is not under a watched path. "
+                        "Add a parent directory with add_to_watchlist first."
+                    ),
+                }
+            else:
+                result = index_folder(
+                    path=folder_path,
+                    use_ai_summaries=arguments.get("use_ai_summaries", True),
+                    storage_path=storage_path,
+                    extra_ignore_patterns=arguments.get("extra_ignore_patterns"),
+                    follow_symlinks=arguments.get("follow_symlinks", False),
+                    incremental=arguments.get("incremental", False),
+                )
+                if result.get("success"):
+                    auto_refresher.register_path(folder_path)
+        elif name == "add_to_watchlist":
+            path = arguments["path"]
+            added = auto_refresher.register_path(path)
+            resolved = os.path.realpath(os.path.expanduser(str(path)))
+            result = {"success": added, "path": resolved, "watched_paths": auto_refresher.get_watched_paths()}
+            if not added:
+                result["message"] = f"Watchlist is full ({MAX_WATCHED_PATHS} paths). Remove a path or edit autorefresh.json manually."
+        elif name == "remove_from_watchlist":
+            path = arguments["path"]
+            removed = auto_refresher.remove_path(path)
+            resolved = os.path.realpath(os.path.expanduser(str(path)))
+            result = {"success": removed, "path": resolved, "watched_paths": auto_refresher.get_watched_paths()}
+        elif name == "list_watched_paths":
+            result = {"watched_paths": auto_refresher.get_watched_paths()}
         elif name == "list_repos":
             result = list_repos(storage_path=storage_path)
         elif name == "get_file_tree":

@@ -11,7 +11,7 @@ async def test_server_lists_all_tools():
     """Test that server lists all 16 tools."""
     tools = await list_tools()
 
-    assert len(tools) == 16
+    assert len(tools) == 19
 
     names = {t.name for t in tools}
     expected = {
@@ -20,6 +20,7 @@ async def test_server_lists_all_tools():
         "invalidate_cache", "search_text", "get_repo_outline",
         "find_references", "find_callers", "find_constructors",
         "find_field_reads", "find_field_writes",
+        "add_to_watchlist", "remove_from_watchlist", "list_watched_paths",
     }
     assert names == expected
 

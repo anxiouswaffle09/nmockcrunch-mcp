@@ -281,6 +281,76 @@ def index_folder(
     max_files = get_max_index_files()
 
     try:
+        # ── Git pre-check: skip the expensive file-tree walk when nothing
+        #    changed since the last index.  Only applies to incremental mode
+        #    inside a git repo with an existing index.
+        if incremental:
+            from ..storage.index_store import _detect_changes_git, _get_git_head
+
+            repo_name = folder_path.name
+            owner = "local"
+            store = IndexStore(base_path=storage_path)
+            existing = store.load_index(owner, repo_name)
+
+            if existing is not None:
+                git_modified, git_deleted, current_head = _detect_changes_git(
+                    folder_path, existing.git_head, existing.file_hashes,
+                )
+
+                if not git_modified and not git_deleted:
+                    # Git says nothing is dirty and HEAD hasn't changed.
+                    # No need to walk the file tree at all.
+                    if current_head and current_head == existing.git_head:
+                        logger.debug("git pre-check: clean, skipping file walk")
+                        return {
+                            "success": True,
+                            "message": "No changes detected",
+                            "repo": f"{owner}/{repo_name}",
+                            "folder_path": str(folder_path),
+                            "changed": 0, "new": 0, "deleted": 0,
+                        }
+                    # HEAD changed but no dirty files — e.g. someone did
+                    # `git stash` or `git checkout`.  Fall through to the
+                    # full path so detect_changes_fast picks up committed
+                    # diffs and new/deleted files.
+                elif not git_deleted:
+                    # Files are dirty but nothing was deleted (no new/removed
+                    # files possible from git's perspective).  Spot-check the
+                    # dirty files' metadata against the index — if timestamps
+                    # match, we already indexed this state.
+                    all_match = True
+                    for rel_path in git_modified:
+                        meta = existing.file_hashes.get(rel_path)
+                        if not meta or isinstance(meta, str):
+                            all_match = False
+                            break
+                        abs_path = folder_path / rel_path
+                        try:
+                            st = abs_path.stat()
+                        except OSError:
+                            all_match = False
+                            break
+                        if (
+                            st.st_mtime_ns != meta.get("mtime_ns")
+                            or st.st_size != meta.get("size")
+                        ):
+                            all_match = False
+                            break
+                    if all_match:
+                        logger.debug(
+                            "git pre-check: %d dirty files already indexed, "
+                            "skipping file walk", len(git_modified),
+                        )
+                        return {
+                            "success": True,
+                            "message": "No changes detected",
+                            "repo": f"{owner}/{repo_name}",
+                            "folder_path": str(folder_path),
+                            "changed": 0, "new": 0, "deleted": 0,
+                        }
+                # If we reach here, something genuinely changed — fall through
+                # to the full discover + detect_changes_fast path.
+
         # Discover source files (with security filtering)
         source_files, discover_warnings, skip_counts = discover_local_files(
             folder_path,

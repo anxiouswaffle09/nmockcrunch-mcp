@@ -295,7 +295,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_file_tree",
-            description="Get the file tree of an indexed repository, optionally filtered by path prefix.",
+            description="Get the file tree of an indexed repository as compact indented text. Each file shows its symbol count and language. Files sorted by symbol count (most important first). Zero-symbol files hidden by default.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -308,9 +308,9 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional path prefix to filter (e.g., 'src/utils')",
                         "default": ""
                     },
-                    "include_summaries": {
+                    "show_empty": {
                         "type": "boolean",
-                        "description": "Include per-file summaries in the tree output",
+                        "description": "Show files with zero symbols (default false)",
                         "default": False
                     }
                 },
@@ -319,7 +319,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_file_outline",
-            description="Get all symbols (functions, classes, methods) in a file with signatures and summaries.",
+            description="Get all symbols (functions, classes, methods, constants) in a file. Returns hierarchical symbol tree with signatures, summaries, and line numbers.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -445,7 +445,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_text",
-            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values). Use exact=true for punctuation-heavy queries like Foo::new(, enum variants, macro invocations. Check 'total_hits' — if it exceeds result_count, use offset/exhaustive to get more.",
+            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values). Use exact=true for punctuation-heavy queries like Foo::new(, enum variants, macro invocations. Check 'total_hits' — if it exceeds result_count, use offset/exhaustive to get more. Scans up to 50MB of content — use file_pattern to narrow scope on large repos.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -675,7 +675,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = get_file_tree(
                 repo=arguments["repo"],
                 path_prefix=arguments.get("path_prefix", ""),
-                include_summaries=arguments.get("include_summaries", False),
+                show_empty=arguments.get("show_empty", False),
                 storage_path=storage_path
             )
         elif name == "get_file_outline":

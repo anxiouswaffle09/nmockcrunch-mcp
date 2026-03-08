@@ -1,4 +1,5 @@
 """Search symbols across repository."""
+import json
 
 import os
 import time
@@ -78,10 +79,9 @@ def search_symbols(
             "score": sym.get("score", 0),
         })
 
-    # Token savings: files containing matches vs symbol byte_lengths of results
+    # Token savings: files containing matches vs actual response size
     raw_bytes = 0
     seen_files: set = set()
-    response_bytes = 0
     content_dir = store._content_dir(owner, name)
     for sym in page:
         f = sym["file"]
@@ -91,7 +91,7 @@ def search_symbols(
                 raw_bytes += os.path.getsize(content_dir / f)
             except OSError:
                 pass
-        response_bytes += sym.get("byte_length", 0)
+    response_bytes = len(json.dumps(scored_results).encode())
     tokens_saved = estimate_savings(raw_bytes, response_bytes)
     total_saved = record_savings(tokens_saved)
 

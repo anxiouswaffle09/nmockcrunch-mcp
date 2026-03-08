@@ -1,4 +1,5 @@
 """Get file outline - symbols in a specific file."""
+import json
 
 import os
 import time
@@ -65,7 +66,7 @@ def get_file_outline(
         raw_bytes = os.path.getsize(raw_file)
     except OSError:
         pass
-    response_bytes = sum(s.get("byte_length", 0) for s in file_symbols)
+    response_bytes = len(json.dumps(symbols_output).encode())
     tokens_saved = estimate_savings(raw_bytes, response_bytes)
     total_saved = record_savings(tokens_saved)
 

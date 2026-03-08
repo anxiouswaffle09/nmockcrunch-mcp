@@ -1,4 +1,5 @@
 """Get high-level repository outline."""
+import json
 
 import os
 import time
@@ -60,12 +61,9 @@ def get_repo_outline(
             raw_bytes += os.path.getsize(content_dir / f)
         except OSError:
             pass
-    tokens_saved = estimate_savings(raw_bytes, 0)
-    total_saved = record_savings(tokens_saved)
-
     elapsed = (time.perf_counter() - start) * 1000
 
-    return {
+    result = {
         "repo": f"{owner}/{name}",
         "indexed_at": index.indexed_at,
         "file_count": len(index.source_files),
@@ -73,10 +71,16 @@ def get_repo_outline(
         "languages": index.languages,
         "directories": dict(dir_file_counts.most_common()),
         "symbol_kinds": dict(kind_counts.most_common()),
-        "_meta": {
-            "timing_ms": round(elapsed, 1),
-            "tokens_saved": tokens_saved,
-            "total_tokens_saved": total_saved,
-            **cost_avoided(tokens_saved, total_saved),
-        },
     }
+
+    response_bytes = len(json.dumps(result).encode())
+    tokens_saved = estimate_savings(raw_bytes, response_bytes)
+    total_saved = record_savings(tokens_saved)
+
+    result["_meta"] = {
+        "timing_ms": round(elapsed, 1),
+        "tokens_saved": tokens_saved,
+        "total_tokens_saved": total_saved,
+        **cost_avoided(tokens_saved, total_saved),
+    }
+    return result
